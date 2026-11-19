@@ -1,0 +1,85 @@
+# AiToEarn gateway: the only public service. Rendered by the nginx image's envsubst at start.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+client_max_body_size 50m;
+proxy_http_version 1.1;
+proxy_connect_timeout 120s;
+proxy_send_timeout 120s;
+proxy_read_timeout 86400s;
+proxy_buffering off;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection $connection_upgrade;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+proxy_set_header X-Forwarded-Host $host;
+
+resolver ${NGINX_LOCAL_RESOLVERS} ipv6=on valid=10s;
+resolver_timeout 5s;
+
+server {
+    listen ${PORT};
+    listen [::]:${PORT};
+    server_name _;
+
+    set $web_upstream http://${WEB_HOST};
+    set $server_upstream http://${SERVER_HOST};
+    set $ai_upstream http://${AI_HOST};
+    set $s3_upstream http://${S3_HOST};
+
+    location = /_nhealth {
+        access_log off;
+        default_type text/plain;
+        return 200 "healthy\n";
+    }
+
+    # Unauthenticated internal routes of the NestJS starter: never expose them.
+    location ~ ^/api/(_shutdown|metrics)(/|$) {
+        return 404;
+    }
+
+    # API: protected by AiToEarn's own JWT / API-key guard. OAuth callbacks and webhooks live here too.
+    location /api/ai/ {
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_set_header Host $proxy_host;
+        proxy_pass $ai_upstream;
+    }
+    location /api/agent/ {
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_set_header Host $proxy_host;
+        proxy_pass $ai_upstream;
+    }
+    location /api/ {
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_set_header Host $proxy_host;
+        proxy_pass $server_upstream;
+    }
+
+    # Public media (social platforms fetch published media from here).
+    location /oss/ {
+        proxy_set_header Authorization "";
+        proxy_set_header Host $proxy_host;
+        rewrite ^/oss/(.*)$ /${S3_BUCKET}/$1 break;
+        proxy_pass $s3_upstream;
+    }
+
+    # Presigned browser uploads (signed for this public host, so keep the Host header).
+    location /${S3_BUCKET}/ {
+        client_max_body_size 500m;
+        proxy_request_buffering off;
+        proxy_set_header Authorization "";
+        proxy_set_header Host $http_host;
+        proxy_pass $s3_upstream;
+    }
+
+    # Web app: it signs the browser in as the admin automatically, so it sits behind a password.
+    location / {
+        auth_basic "AiToEarn";
+        auth_basic_user_file /etc/nginx/aitoearn.htpasswd;
+        proxy_set_header Host $host;
+        proxy_pass $web_upstream;
+    }
+}
